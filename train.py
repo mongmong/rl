@@ -1,5 +1,4 @@
 import argparse
-import csv
 import logging
 import os
 import shutil
@@ -263,7 +262,6 @@ class TrainingProgressCallback(BaseCallback):
         total_timesteps: int,
         progress_interval_pct: float = 5.0,
         start_timesteps: int = 0,
-        metrics_csv_path: str | None = None,
         logger: logging.Logger | None = None,
     ) -> None:
         super().__init__()
@@ -276,9 +274,6 @@ class TrainingProgressCallback(BaseCallback):
         self.episodes_completed = 0
         self.last_episode_reward = None
         self.last_episode_length = None
-        self.metrics_csv_path = metrics_csv_path
-        self.metrics_file = None
-        self.metrics_writer = None
         self.progress_logger = logger
 
     def _log(self, message: str) -> None:
@@ -289,38 +284,6 @@ class TrainingProgressCallback(BaseCallback):
 
     def _on_training_start(self) -> None:
         self.start_time = time.time()
-        if self.metrics_csv_path:
-            path = Path(self.metrics_csv_path)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            file_exists = path.exists() and path.stat().st_size > 0
-            self.metrics_file = path.open("a", newline="", encoding="utf-8")
-            self.metrics_writer = csv.DictWriter(
-                self.metrics_file,
-                fieldnames=[
-                    "timestamp",
-                    "run_steps",
-                    "total_steps",
-                    "target_steps",
-                    "percent",
-                    "episodes",
-                    "steps_per_sec",
-                    "elapsed_s",
-                    "eta_s",
-                    "ep_rew_mean",
-                    "ep_len_mean",
-                    "last_ep_rew",
-                    "last_ep_len",
-                    "pg_loss",
-                    "v_loss",
-                    "ent_loss",
-                    "approx_kl",
-                    "clip_frac",
-                    "total_loss",
-                ],
-            )
-            if not file_exists:
-                self.metrics_writer.writeheader()
-                self.metrics_file.flush()
         self._log(
             f"[progress] 0.00% (0/{self.total_timesteps_target}) | episodes 0"
         )
@@ -368,11 +331,6 @@ class TrainingProgressCallback(BaseCallback):
         if self.last_episode_length is not None:
             metric_parts.append(f"last_ep_len {self.last_episode_length}")
 
-        latest_train_metrics = getattr(self.model, "latest_train_metrics", {})
-        for key in ["pg_loss", "v_loss", "ent_loss", "approx_kl", "clip_frac", "total_loss"]:
-            if key in latest_train_metrics:
-                metric_parts.append(f"{key} {latest_train_metrics[key]:.4f}")
-
         metrics_str = " | ".join(metric_parts) if metric_parts else "metrics pending"
         self._log(
             f"[progress] {pct:6.2f}% ({current}/{self.total_timesteps_target}) "
@@ -382,32 +340,6 @@ class TrainingProgressCallback(BaseCallback):
             f"| eta {format_seconds(eta_seconds)} "
             f"| {metrics_str}"
         )
-
-        if self.metrics_writer:
-            self.metrics_writer.writerow(
-                {
-                    "timestamp": int(time.time()),
-                    "run_steps": current,
-                    "total_steps": current_total,
-                    "target_steps": self.total_timesteps_target,
-                    "percent": round(pct, 4),
-                    "episodes": self.episodes_completed,
-                    "steps_per_sec": round(steps_per_sec, 6),
-                    "elapsed_s": round(elapsed, 3),
-                    "eta_s": round(eta_seconds, 3),
-                    "ep_rew_mean": None if ep_rew_mean is None else round(ep_rew_mean, 6),
-                    "ep_len_mean": None if ep_len_mean is None else round(ep_len_mean, 6),
-                    "last_ep_rew": self.last_episode_reward,
-                    "last_ep_len": self.last_episode_length,
-                    "pg_loss": latest_train_metrics.get("pg_loss"),
-                    "v_loss": latest_train_metrics.get("v_loss"),
-                    "ent_loss": latest_train_metrics.get("ent_loss"),
-                    "approx_kl": latest_train_metrics.get("approx_kl"),
-                    "clip_frac": latest_train_metrics.get("clip_frac"),
-                    "total_loss": latest_train_metrics.get("total_loss"),
-                }
-            )
-            self.metrics_file.flush()
 
         while self.next_report_step <= current:
             self.next_report_step += self.interval_steps
@@ -420,17 +352,13 @@ class TrainingProgressCallback(BaseCallback):
             f"| episodes {self.episodes_completed} "
             f"| elapsed {format_seconds(elapsed)}"
         )
-        if self.metrics_file:
-            self.metrics_file.close()
-            self.metrics_file = None
-            self.metrics_writer = None
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", default="dino")
     parser.add_argument("--timesteps", type=int, default=None)
-    parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--no-headless", action="store_true")
     parser.add_argument("--model_path", default="models/dino_ppo")
     parser.add_argument("--reward_mode", default=None)
     parser.add_argument("--game_url", default=None)
@@ -438,7 +366,6 @@ def main():
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--config", default="configs/default_dino.yaml")
     parser.add_argument("--progress_interval_pct", type=float, default=0.1)
-    parser.add_argument("--progress_metrics_suffix", default="_progress_metrics.csv")
     parser.add_argument("--checkpoint_freq", type=int, default=10000)
     parser.add_argument("--new", action="store_true")
     args = parser.parse_args()
@@ -450,6 +377,7 @@ def main():
     reward_mode = args.reward_mode or config["env"]["reward_mode"]
     game_url = args.game_url or config["env"]["game_url"]
     timesteps = args.timesteps or int(config["training"]["timesteps"])
+    headless = not args.no_headless
 
     os.makedirs("models", exist_ok=True)
     model_prefix = normalize_model_prefix(args.model_path)
@@ -459,19 +387,20 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=True)
 
     model_output_path = run_dir / "model.zip"
-    metrics_csv_path = run_dir / f"{run_dir.name}{args.progress_metrics_suffix}"
     checkpoint_freq = int(args.checkpoint_freq)
     checkpoint_callback_freq = max(1, checkpoint_freq // max(1, args.n_envs))
     checkpoint_dir = run_dir / "checkpoints"
     best_dir = run_dir / "best"
     eval_log_dir = run_dir / "eval_logs"
-    train_log_path = run_dir / "train.log"
+    logs_dir = run_dir / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    log_timestamp = datetime.now().strftime(TIMESTAMP_FMT)
+    train_log_path = logs_dir / f"{log_timestamp}_train.log"
 
     logger = setup_logger(train_log_path)
     logger.info("Model prefix: %s", model_prefix)
     logger.info("Run dir: %s", run_dir)
     logger.info("Model output: %s", model_output_path)
-    logger.info("Progress CSV: %s", metrics_csv_path)
     logger.info("Train log: %s", train_log_path)
     logger.info("Best model dir: %s", best_dir)
     if checkpoint_freq > 0:
@@ -483,7 +412,7 @@ def main():
         )
 
     env = make_vec_env(
-        make_env(args.headless, reward_mode, game_url, config),
+        make_env(headless, reward_mode, game_url, config),
         n_envs=args.n_envs,
         seed=args.seed,
         vec_env_cls=DummyVecEnv,
@@ -542,7 +471,6 @@ def main():
         total_timesteps=timesteps,
         progress_interval_pct=args.progress_interval_pct,
         start_timesteps=int(model.num_timesteps),
-        metrics_csv_path=str(metrics_csv_path),
         logger=logger,
     )
     callbacks.append(progress_callback)

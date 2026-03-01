@@ -19,7 +19,7 @@ training:
   n_epochs: 4
   vf_coef: 0.5
   max_grad_norm: 0.5
-  save_freq: 20000
-  eval_freq: 20000
+  save_freq: 10000
+  eval_freq: 10000
   eval_episodes: 5
   tensorboard_log: runs/dino

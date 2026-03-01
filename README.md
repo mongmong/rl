@@ -13,7 +13,7 @@ uv run python -m playwright install chromium
 ## Training
 
 ```bash
-uv run python train.py --env dino --headless --timesteps 200000 --model_path models/dino_ppo
+uv run python train.py --env dino --timesteps 200000 --model_path models/dino_ppo
 ```
 
 `--model_path` is a prefix. Each run creates a timestamped run folder:
@@ -23,8 +23,7 @@ uv run python train.py --env dino --headless --timesteps 200000 --model_path mod
 Inside that run folder:
 
 - `model.zip` (final saved model for the run)
-- `train.log` (all training logs via Python `logging`)
-- `dino_ppo_YYYYMMDD_HHMMSS_progress_metrics.csv` (progress/metrics CSV)
+- `logs/YYYYMMDD_HHMMSS_train.log` (all training logs via Python `logging`)
 - `checkpoints/` (periodic checkpoints + mirrored saved model)
 - `best/` (eval-best `best_model.zip`, if produced)
 - `eval_logs/` (EvalCallback logs)
@@ -41,13 +40,13 @@ Default (without `--new`):
 Force fresh training even when prior runs exist:
 
 ```bash
-uv run python train.py --env dino --headless --timesteps 50000 --model_path models/dino_ppo --new
+uv run python train.py --env dino --timesteps 50000 --model_path models/dino_ppo --new
 ```
 
 ## Checkpoint Frequency
 
 ```bash
-uv run python train.py --env dino --headless --timesteps 200000 --checkpoint_freq 10000
+uv run python train.py --env dino --timesteps 200000 --checkpoint_freq 10000
 ```
 
 `--checkpoint_freq` is interpreted as timesteps. With `n_envs > 1`, callback frequency is adjusted to keep checkpoint cadence close to requested timestep intervals.
@@ -55,8 +54,10 @@ uv run python train.py --env dino --headless --timesteps 200000 --checkpoint_fre
 ## Evaluation
 
 ```bash
-uv run python evaluate.py --model_path models/dino_ppo --episodes 10 --headless
+uv run python evaluate.py --model_path models/dino_ppo --episodes 10
 ```
+
+`train.py` and `evaluate.py` default to headless. Use `--no-headless` for a visible browser window.
 
 `evaluate.py` model resolution:
 
