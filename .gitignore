@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Environments
+.venv/
+
+# Training artifacts
+models/
+runs/
+
+# OS
+.DS_Store

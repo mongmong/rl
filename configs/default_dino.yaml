@@ -1,0 +1,25 @@
+env:
+  game_url: https://elgoog.im/t-rex/
+  frame_size: [84, 84]
+  frame_stack: 4
+  action_repeat: 4
+  max_episode_seconds: 120
+  reward_mode: survival
+
+training:
+  algo: PPO
+  timesteps: 200000
+  learning_rate: 0.00025
+  n_steps: 1024
+  batch_size: 256
+  gamma: 0.99
+  gae_lambda: 0.95
+  ent_coef: 0.01
+  clip_range: 0.1
+  n_epochs: 4
+  vf_coef: 0.5
+  max_grad_norm: 0.5
+  save_freq: 20000
+  eval_freq: 20000
+  eval_episodes: 5
+  tensorboard_log: runs/dino
