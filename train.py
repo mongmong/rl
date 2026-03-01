@@ -1,15 +1,21 @@
 import argparse
 import csv
+import logging
 import os
 import shutil
 import time
 from datetime import datetime
-from statistics import mean
 from pathlib import Path
+from statistics import mean
 
 import yaml
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback, EvalCallback
+from stable_baselines3.common.callbacks import (
+    BaseCallback,
+    CallbackList,
+    CheckpointCallback,
+    EvalCallback,
+)
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import DummyVecEnv
 
@@ -55,108 +61,149 @@ def normalize_model_prefix(path_arg: str) -> Path:
     return model_prefix
 
 
-def build_timestamped_model_path(model_prefix: Path) -> Path:
+def parse_run_timestamp(run_dir: Path, model_prefix: Path):
+    prefix = f"{model_prefix.name}_"
+    if not run_dir.name.startswith(prefix):
+        return None
+    ts = run_dir.name[len(prefix) :]
+    try:
+        return datetime.strptime(ts, TIMESTAMP_FMT)
+    except ValueError:
+        return None
+
+
+def build_timestamped_run_dir(model_prefix: Path) -> Path:
     ts = datetime.now().strftime(TIMESTAMP_FMT)
-    return model_prefix.with_name(f"{model_prefix.name}_{ts}.zip")
+    return model_prefix.parent / f"{model_prefix.name}_{ts}"
 
 
-def find_latest_timestamped_model(model_prefix: Path) -> Path | None:
-    pattern = f"{model_prefix.name}_*.zip"
-    latest_path = None
-    latest_dt = None
-    for path in model_prefix.parent.glob(pattern):
-        suffix = path.stem[len(model_prefix.name) + 1 :]
-        try:
-            dt = datetime.strptime(suffix, TIMESTAMP_FMT)
-        except ValueError:
+def iter_run_dirs(model_prefix: Path):
+    pattern = f"{model_prefix.name}_*"
+    for candidate in model_prefix.parent.glob(pattern):
+        if not candidate.is_dir():
             continue
-        if latest_dt is None or dt > latest_dt:
-            latest_dt = dt
-            latest_path = path
-    return latest_path
+        if parse_run_timestamp(candidate, model_prefix) is None:
+            continue
+        yield candidate
 
 
-def find_latest_saved_model_by_mtime(model_prefix: Path) -> Path | None:
-    latest_path = None
+def find_latest_saved_model(model_prefix: Path) -> Path | None:
+    latest = None
     latest_mtime = -1.0
-    pattern = f"{model_prefix.name}_*.zip"
-    for path in model_prefix.parent.glob(pattern):
-        suffix = path.stem[len(model_prefix.name) + 1 :]
-        try:
-            datetime.strptime(suffix, TIMESTAMP_FMT)
-        except ValueError:
+    for run_dir in iter_run_dirs(model_prefix):
+        model_path = run_dir / "model.zip"
+        if not model_path.exists():
             continue
-        mtime = path.stat().st_mtime
+        mtime = model_path.stat().st_mtime
         if mtime > latest_mtime:
             latest_mtime = mtime
-            latest_path = path
-    return latest_path
+            latest = model_path
+    return latest
 
 
-def find_latest_checkpoint_for_prefix(model_prefix: Path) -> Path | None:
-    latest_ckpt = None
+def find_latest_checkpoint(model_prefix: Path) -> Path | None:
+    latest = None
     latest_mtime = -1.0
-    dir_pattern = f"{model_prefix.name}_*_checkpoints"
-    for ckpt_dir in model_prefix.parent.glob(dir_pattern):
-        if not ckpt_dir.is_dir():
+    for run_dir in iter_run_dirs(model_prefix):
+        checkpoint_dir = run_dir / "checkpoints"
+        if not checkpoint_dir.exists():
             continue
-        for ckpt_file in ckpt_dir.glob("*.zip"):
-            mtime = ckpt_file.stat().st_mtime
+        for ckpt in checkpoint_dir.glob("*.zip"):
+            mtime = ckpt.stat().st_mtime
             if mtime > latest_mtime:
                 latest_mtime = mtime
-                latest_ckpt = ckpt_file
-    return latest_ckpt
+                latest = ckpt
+    return latest
 
 
-def sync_saved_models_from_checkpoints(model_prefix: Path) -> list[tuple[Path, Path]]:
-    updates = []
-    dir_pattern = f"{model_prefix.name}_*_checkpoints"
-    for ckpt_dir in model_prefix.parent.glob(dir_pattern):
-        if not ckpt_dir.is_dir():
-            continue
-        latest_ckpt = None
-        latest_mtime = -1.0
-        for ckpt_file in ckpt_dir.glob("*.zip"):
-            mtime = ckpt_file.stat().st_mtime
-            if mtime > latest_mtime:
-                latest_mtime = mtime
-                latest_ckpt = ckpt_file
+def latest_checkpoint_in_run(run_dir: Path) -> Path | None:
+    checkpoint_dir = run_dir / "checkpoints"
+    if not checkpoint_dir.exists():
+        return None
+    latest = None
+    latest_mtime = -1.0
+    for ckpt in checkpoint_dir.glob("*.zip"):
+        mtime = ckpt.stat().st_mtime
+        if mtime > latest_mtime:
+            latest_mtime = mtime
+            latest = ckpt
+    return latest
+
+
+def sync_saved_models_from_checkpoints(model_prefix: Path, logger: logging.Logger) -> None:
+    for run_dir in iter_run_dirs(model_prefix):
+        latest_ckpt = latest_checkpoint_in_run(run_dir)
         if latest_ckpt is None:
             continue
-        if not ckpt_dir.name.endswith("_checkpoints"):
-            continue
-        run_stem = ckpt_dir.name[: -len("_checkpoints")]
-        saved_model_path = ckpt_dir.parent / f"{run_stem}.zip"
-        needs_update = (
-            (not saved_model_path.exists())
-            or saved_model_path.stat().st_mtime < latest_ckpt.stat().st_mtime
+        model_path = run_dir / "model.zip"
+        needs_update = (not model_path.exists()) or (
+            model_path.stat().st_mtime < latest_ckpt.stat().st_mtime
         )
         if needs_update:
-            shutil.copy2(latest_ckpt, saved_model_path)
-            updates.append((saved_model_path, latest_ckpt))
-    return updates
+            shutil.copy2(latest_ckpt, model_path)
+            logger.info(
+                "Synced stale saved model from checkpoint: %s <- %s",
+                model_path,
+                latest_ckpt,
+            )
 
 
-def ensure_saved_models_in_checkpoints(model_prefix: Path) -> list[tuple[Path, Path]]:
-    updates = []
-    pattern = f"{model_prefix.name}_*.zip"
-    for saved_model_path in model_prefix.parent.glob(pattern):
-        suffix = saved_model_path.stem[len(model_prefix.name) + 1 :]
-        try:
-            datetime.strptime(suffix, TIMESTAMP_FMT)
-        except ValueError:
+def ensure_saved_models_in_checkpoints(model_prefix: Path, logger: logging.Logger) -> None:
+    for run_dir in iter_run_dirs(model_prefix):
+        model_path = run_dir / "model.zip"
+        if not model_path.exists():
             continue
-        checkpoint_dir = saved_model_path.parent / f"{saved_model_path.stem}_checkpoints"
+        checkpoint_dir = run_dir / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        mirrored_path = checkpoint_dir / f"{saved_model_path.stem}_saved_model.zip"
-        needs_update = (
-            (not mirrored_path.exists())
-            or mirrored_path.stat().st_mtime < saved_model_path.stat().st_mtime
+        mirror_path = checkpoint_dir / "saved_model_latest.zip"
+        needs_update = (not mirror_path.exists()) or (
+            mirror_path.stat().st_mtime < model_path.stat().st_mtime
         )
         if needs_update:
-            shutil.copy2(saved_model_path, mirrored_path)
-            updates.append((mirrored_path, saved_model_path))
-    return updates
+            shutil.copy2(model_path, mirror_path)
+            logger.info(
+                "Mirrored saved model into checkpoints: %s <- %s",
+                mirror_path,
+                model_path,
+            )
+
+
+def pick_resume_source(model_prefix: Path, logger: logging.Logger) -> Path | None:
+    latest_saved = find_latest_saved_model(model_prefix)
+    latest_ckpt = find_latest_checkpoint(model_prefix)
+
+    if latest_saved and latest_ckpt:
+        if latest_ckpt.stat().st_mtime >= latest_saved.stat().st_mtime:
+            logger.info("Resume source selected (checkpoint): %s", latest_ckpt)
+            return latest_ckpt
+        logger.info("Resume source selected (saved model): %s", latest_saved)
+        return latest_saved
+    if latest_ckpt:
+        logger.info("Resume source selected (checkpoint): %s", latest_ckpt)
+        return latest_ckpt
+    if latest_saved:
+        logger.info("Resume source selected (saved model): %s", latest_saved)
+        return latest_saved
+    return None
+
+
+def setup_logger(log_path: Path) -> logging.Logger:
+    logger = logging.getLogger("train")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.propagate = False
+
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+
+    file_handler = logging.FileHandler(log_path, encoding="utf-8")
+    file_handler.setFormatter(fmt)
+    logger.addHandler(file_handler)
+
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(fmt)
+    logger.addHandler(stream_handler)
+
+    return logger
 
 
 def create_new_model(env, config: dict):
@@ -182,6 +229,7 @@ class PPOWithTrainMetrics(PPO):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.latest_train_metrics = {}
+        self.progress_logger: logging.Logger | None = None
 
     def train(self) -> None:
         super().train()
@@ -204,9 +252,9 @@ class PPOWithTrainMetrics(PPO):
             except (TypeError, ValueError):
                 continue
         self.latest_train_metrics = metrics
-        if metrics:
+        if metrics and self.progress_logger is not None:
             parts = [f"{name} {value:.4f}" for name, value in metrics.items()]
-            print(f"[ppo] {' | '.join(parts)}", flush=True)
+            self.progress_logger.info("[ppo] %s", " | ".join(parts))
 
 
 class TrainingProgressCallback(BaseCallback):
@@ -216,6 +264,7 @@ class TrainingProgressCallback(BaseCallback):
         progress_interval_pct: float = 5.0,
         start_timesteps: int = 0,
         metrics_csv_path: str | None = None,
+        logger: logging.Logger | None = None,
     ) -> None:
         super().__init__()
         self.total_timesteps_target = max(1, int(total_timesteps))
@@ -230,6 +279,13 @@ class TrainingProgressCallback(BaseCallback):
         self.metrics_csv_path = metrics_csv_path
         self.metrics_file = None
         self.metrics_writer = None
+        self.progress_logger = logger
+
+    def _log(self, message: str) -> None:
+        if self.progress_logger is not None:
+            self.progress_logger.info(message)
+        else:
+            print(message, flush=True)
 
     def _on_training_start(self) -> None:
         self.start_time = time.time()
@@ -265,9 +321,8 @@ class TrainingProgressCallback(BaseCallback):
             if not file_exists:
                 self.metrics_writer.writeheader()
                 self.metrics_file.flush()
-        print(
-            f"[progress] 0.00% (0/{self.total_timesteps_target}) | episodes 0",
-            flush=True,
+        self._log(
+            f"[progress] 0.00% (0/{self.total_timesteps_target}) | episodes 0"
         )
 
     def _on_step(self) -> bool:
@@ -293,9 +348,11 @@ class TrainingProgressCallback(BaseCallback):
         steps_per_sec = current / elapsed
         remaining_steps = max(0, self.total_timesteps_target - current)
         eta_seconds = remaining_steps / max(1e-9, steps_per_sec)
+
         metric_parts = []
         ep_rew_mean = None
         ep_len_mean = None
+
         if self.model.ep_info_buffer:
             rewards = [float(item["r"]) for item in self.model.ep_info_buffer if "r" in item]
             lengths = [float(item["l"]) for item in self.model.ep_info_buffer if "l" in item]
@@ -305,24 +362,27 @@ class TrainingProgressCallback(BaseCallback):
             if lengths:
                 ep_len_mean = mean(lengths)
                 metric_parts.append(f"ep_len_mean {ep_len_mean:.1f}")
+
         if self.last_episode_reward is not None:
             metric_parts.append(f"last_ep_rew {self.last_episode_reward:.2f}")
         if self.last_episode_length is not None:
             metric_parts.append(f"last_ep_len {self.last_episode_length}")
+
         latest_train_metrics = getattr(self.model, "latest_train_metrics", {})
         for key in ["pg_loss", "v_loss", "ent_loss", "approx_kl", "clip_frac", "total_loss"]:
             if key in latest_train_metrics:
                 metric_parts.append(f"{key} {latest_train_metrics[key]:.4f}")
+
         metrics_str = " | ".join(metric_parts) if metric_parts else "metrics pending"
-        print(
+        self._log(
             f"[progress] {pct:6.2f}% ({current}/{self.total_timesteps_target}) "
             f"| total_steps {current_total} "
             f"| episodes {self.episodes_completed} "
             f"| {steps_per_sec:.2f} steps/s | elapsed {format_seconds(elapsed)} "
             f"| eta {format_seconds(eta_seconds)} "
-            f"| {metrics_str}",
-            flush=True,
+            f"| {metrics_str}"
         )
+
         if self.metrics_writer:
             self.metrics_writer.writerow(
                 {
@@ -355,11 +415,10 @@ class TrainingProgressCallback(BaseCallback):
 
     def _on_training_end(self) -> None:
         elapsed = time.time() - self.start_time
-        print(
+        self._log(
             f"[progress] 100.00% ({self.total_timesteps_target}/{self.total_timesteps_target}) "
             f"| episodes {self.episodes_completed} "
-            f"| elapsed {format_seconds(elapsed)}",
-            flush=True,
+            f"| elapsed {format_seconds(elapsed)}"
         )
         if self.metrics_file:
             self.metrics_file.close()
@@ -395,24 +454,32 @@ def main():
     os.makedirs("models", exist_ok=True)
     model_prefix = normalize_model_prefix(args.model_path)
     model_prefix.parent.mkdir(parents=True, exist_ok=True)
-    model_output_path = build_timestamped_model_path(model_prefix)
-    metrics_csv_path = model_output_path.with_name(
-        f"{model_output_path.stem}{args.progress_metrics_suffix}"
-    )
+
+    run_dir = build_timestamped_run_dir(model_prefix)
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    model_output_path = run_dir / "model.zip"
+    metrics_csv_path = run_dir / f"{run_dir.name}{args.progress_metrics_suffix}"
     checkpoint_freq = int(args.checkpoint_freq)
     checkpoint_callback_freq = max(1, checkpoint_freq // max(1, args.n_envs))
-    checkpoint_dir = model_output_path.parent / f"{model_output_path.stem}_checkpoints"
-    best_dir = model_output_path.parent / f"{model_output_path.stem}_best"
-    eval_log_dir = model_output_path.parent / f"{model_output_path.stem}_eval_logs"
-    print(f"[train] Model prefix: {model_prefix}", flush=True)
-    print(f"[train] Run model output: {model_output_path}", flush=True)
-    print(f"[train] Progress CSV: {metrics_csv_path}", flush=True)
-    print(f"[train] Best model dir: {best_dir}", flush=True)
+    checkpoint_dir = run_dir / "checkpoints"
+    best_dir = run_dir / "best"
+    eval_log_dir = run_dir / "eval_logs"
+    train_log_path = run_dir / "train.log"
+
+    logger = setup_logger(train_log_path)
+    logger.info("Model prefix: %s", model_prefix)
+    logger.info("Run dir: %s", run_dir)
+    logger.info("Model output: %s", model_output_path)
+    logger.info("Progress CSV: %s", metrics_csv_path)
+    logger.info("Train log: %s", train_log_path)
+    logger.info("Best model dir: %s", best_dir)
     if checkpoint_freq > 0:
-        print(
-            f"[train] Checkpoints: {checkpoint_dir} "
-            f"(target every {checkpoint_freq} timesteps, callback every {checkpoint_callback_freq} steps)",
-            flush=True,
+        logger.info(
+            "Checkpoints: %s (target every %s timesteps, callback every %s steps)",
+            checkpoint_dir,
+            checkpoint_freq,
+            checkpoint_callback_freq,
         )
 
     env = make_vec_env(
@@ -428,36 +495,15 @@ def main():
         vec_env_cls=DummyVecEnv,
     )
 
-    sync_updates = sync_saved_models_from_checkpoints(model_prefix)
-    for saved_model, source_ckpt in sync_updates:
-        print(
-            f"[train] Synced stale saved model from checkpoint: {saved_model} <- {source_ckpt}",
-            flush=True,
-        )
-    checkpoint_mirror_updates = ensure_saved_models_in_checkpoints(model_prefix)
-    for mirrored_model, saved_model in checkpoint_mirror_updates:
-        print(
-            f"[train] Mirrored saved model into checkpoints: {mirrored_model} <- {saved_model}",
-            flush=True,
-        )
+    if not args.new:
+        sync_saved_models_from_checkpoints(model_prefix, logger)
+        ensure_saved_models_in_checkpoints(model_prefix, logger)
 
-    latest_saved_model = None if args.new else find_latest_saved_model_by_mtime(model_prefix)
-    latest_checkpoint = None if args.new else find_latest_checkpoint_for_prefix(model_prefix)
-
-    resume_source = None
-    if latest_checkpoint and latest_saved_model:
-        if latest_checkpoint.stat().st_mtime >= latest_saved_model.stat().st_mtime:
-            resume_source = latest_checkpoint
-        else:
-            resume_source = latest_saved_model
-    elif latest_checkpoint:
-        resume_source = latest_checkpoint
-    elif latest_saved_model:
-        resume_source = latest_saved_model
-
+    resume_source = None if args.new else pick_resume_source(model_prefix, logger)
     should_resume = resume_source is not None
+
     if should_resume:
-        print(f"[train] Resuming from latest artifact: {resume_source}", flush=True)
+        logger.info("Resuming from latest artifact: %s", resume_source)
         model = PPOWithTrainMetrics.load(
             str(resume_source),
             env=env,
@@ -465,11 +511,13 @@ def main():
             device="auto",
         )
     elif args.new:
-        print("[train] --new specified: starting a fresh model.", flush=True)
+        logger.info("--new specified: starting a fresh model")
         model = create_new_model(env, config)
     else:
-        print("[train] No prior model or checkpoint found: starting a fresh model.", flush=True)
+        logger.info("No prior model or checkpoint found: starting a fresh model")
         model = create_new_model(env, config)
+
+    model.progress_logger = logger
 
     eval_callback = EvalCallback(
         eval_env,
@@ -480,30 +528,40 @@ def main():
         deterministic=True,
         render=False,
     )
+
     callbacks = [eval_callback]
     if checkpoint_freq > 0:
         checkpoint_callback = CheckpointCallback(
             save_freq=checkpoint_callback_freq,
             save_path=str(checkpoint_dir),
-            name_prefix=f"{model_output_path.stem}_ckpt",
+            name_prefix="ckpt",
         )
         callbacks.append(checkpoint_callback)
+
     progress_callback = TrainingProgressCallback(
         total_timesteps=timesteps,
         progress_interval_pct=args.progress_interval_pct,
         start_timesteps=int(model.num_timesteps),
         metrics_csv_path=str(metrics_csv_path),
+        logger=logger,
     )
     callbacks.append(progress_callback)
     callback = CallbackList(callbacks)
 
-    model.learn(total_timesteps=timesteps, callback=callback, reset_num_timesteps=not should_resume)
+    model.learn(
+        total_timesteps=timesteps,
+        callback=callback,
+        reset_num_timesteps=not should_resume,
+    )
+
     model.save(str(model_output_path))
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
-    final_checkpoint_copy = checkpoint_dir / f"{model_output_path.stem}_saved_model.zip"
-    shutil.copy2(model_output_path, final_checkpoint_copy)
-    print(f"[train] Saved model: {model_output_path}", flush=True)
-    print(f"[train] Saved model mirrored in checkpoints: {final_checkpoint_copy}", flush=True)
+    shutil.copy2(model_output_path, checkpoint_dir / "saved_model_latest.zip")
+    logger.info("Saved model: %s", model_output_path)
+    logger.info(
+        "Saved model mirrored in checkpoints: %s",
+        checkpoint_dir / "saved_model_latest.zip",
+    )
 
 
 if __name__ == "__main__":

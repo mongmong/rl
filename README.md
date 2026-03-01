@@ -1,10 +1,8 @@
 # RL Chrome Dino
 
-This repo trains a reinforcement learning agent to play the Chrome Dino game in the browser using Playwright and Stable-Baselines3.
+This repo trains a reinforcement learning agent to play Chrome Dino in a browser using Playwright + Stable-Baselines3 PPO.
 
 ## Setup (uv)
-
-1. Create a Python environment and sync dependencies:
 
 ```bash
 uv venv
@@ -15,37 +13,44 @@ uv run python -m playwright install chromium
 ## Training
 
 ```bash
-uv run python train.py --env dino --headless --timesteps 200000
+uv run python train.py --env dino --headless --timesteps 200000 --model_path models/dino_ppo
 ```
 
-Models are saved under `models/`.
-`--model_path` is treated as a model prefix, and each run saves a timestamped model file.
-For `--model_path models/dino_ppo`, one run outputs:
-- `models/dino_ppo_YYYYMMDD_HHMMSS.zip` as the run model
-- `models/dino_ppo_YYYYMMDD_HHMMSS_checkpoints/` for periodic checkpoints
-- `models/dino_ppo_YYYYMMDD_HHMMSS_best/` for eval-best model (`best_model.zip`)
-- `models/dino_ppo_YYYYMMDD_HHMMSS_progress_metrics.csv` for progress metrics CSV
+`--model_path` is a prefix. Each run creates a timestamped run folder:
 
-By default, training auto-resumes from the freshest artifact matching the prefix (saved model or checkpoint).
-Startup also auto-recovers interrupted runs:
-- if a checkpoint is newer than its saved model (or saved model is missing), the saved model is refreshed from the newest checkpoint
-- resume source is chosen from the freshest artifact across saved models and checkpoints
-- saved models are mirrored into their checkpoint folders
-Use `--new` to force a fresh model even if previous runs exist:
+- `models/dino_ppo_YYYYMMDD_HHMMSS/`
+
+Inside that run folder:
+
+- `model.zip` (final saved model for the run)
+- `train.log` (all training logs via Python `logging`)
+- `dino_ppo_YYYYMMDD_HHMMSS_progress_metrics.csv` (progress/metrics CSV)
+- `checkpoints/` (periodic checkpoints + mirrored saved model)
+- `best/` (eval-best `best_model.zip`, if produced)
+- `eval_logs/` (EvalCallback logs)
+
+## Resume Behavior
+
+Default (without `--new`):
+
+- auto-discovers latest artifact from prior runs for the same prefix
+- resumes from the freshest source among saved models and checkpoints
+- repairs stale/missing saved models from newer checkpoints
+- mirrors saved models into checkpoint folders
+
+Force fresh training even when prior runs exist:
 
 ```bash
 uv run python train.py --env dino --headless --timesteps 50000 --model_path models/dino_ppo --new
 ```
 
-Control checkpoint frequency (timesteps):
+## Checkpoint Frequency
 
 ```bash
 uv run python train.py --env dino --headless --timesteps 200000 --checkpoint_freq 10000
 ```
 
-Checkpoint note:
-- `--checkpoint_freq` is interpreted in timesteps.
-- with `n_envs > 1`, internal callback frequency is adjusted so checkpoint cadence stays close to the requested timestep interval.
+`--checkpoint_freq` is interpreted as timesteps. With `n_envs > 1`, callback frequency is adjusted to keep checkpoint cadence close to requested timestep intervals.
 
 ## Evaluation
 
@@ -53,14 +58,32 @@ Checkpoint note:
 uv run python evaluate.py --model_path models/dino_ppo --episodes 10 --headless
 ```
 
-Evaluation model path behavior:
-- if `--model_path` ends with `.zip`, that exact file is loaded
-- otherwise it is treated as a prefix and the latest timestamped model is loaded
+`evaluate.py` model resolution:
+
+- if `--model_path` ends with `.zip`: load exact file
+- if `--model_path` is a run directory: load `<run_dir>/model.zip`
+- otherwise: treat as prefix and load latest timestamped run directory model
 
 ## Configuration
 
-Default settings live in `configs/default_dino.yaml`. You can change frame size, reward mode, game URL, or PPO hyperparameters there or via CLI flags (`--game_url`, `--reward_mode`, etc.).
+Defaults are in `configs/default_dino.yaml`.
+
+Key env config:
+
+- `game_url`
+- `frame_size`
+- `frame_stack`
+- `action_repeat`
+- `max_episode_seconds`
+- `reward_mode`
+
+Key training config:
+
+- PPO hyperparameters (`learning_rate`, `n_steps`, `batch_size`, etc.)
+- `timesteps`
+- `save_freq`, `eval_freq`, `eval_episodes`
+- `tensorboard_log`
 
 ## Target Game
 
-Default target is `https://elgoog.im/t-rex/` because it is accessible in headless automation. You can point to another Dino URL with `--game_url` or by changing `env.game_url` in the config.
+Default target is `https://elgoog.im/t-rex/` (works in headless automation). Override with `--game_url`.

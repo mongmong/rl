@@ -19,33 +19,68 @@ def normalize_model_prefix(path_arg: str) -> Path:
     return path
 
 
+def parse_run_timestamp(run_dir: Path, model_prefix: Path):
+    prefix = f"{model_prefix.name}_"
+    if not run_dir.name.startswith(prefix):
+        return None
+    ts = run_dir.name[len(prefix) :]
+    try:
+        return datetime.strptime(ts, TIMESTAMP_FMT)
+    except ValueError:
+        return None
+
+
 def resolve_model_path(path_arg: str) -> Path:
     path = Path(path_arg)
+
     if path.suffix == ".zip":
         if not path.exists():
             raise FileNotFoundError(f"Model not found: {path}")
         return path
 
+    # Direct run directory path
+    if path.is_dir():
+        direct = path / "model.zip"
+        if direct.exists():
+            return direct
+        raise FileNotFoundError(f"Run directory does not contain model.zip: {path}")
+
+    # Prefix mode: choose latest timestamped run dir and load model.zip
     prefix = normalize_model_prefix(path_arg)
-    latest_path = None
-    latest_mtime = -1.0
-    pattern = f"{prefix.name}_*.zip"
-    for candidate in prefix.parent.glob(pattern):
-        suffix = candidate.stem[len(prefix.name) + 1 :]
-        try:
-            datetime.strptime(suffix, TIMESTAMP_FMT)
-        except ValueError:
+    latest_run = None
+    latest_dt = None
+    for candidate in prefix.parent.glob(f"{prefix.name}_*"):
+        if not candidate.is_dir():
             continue
+        dt = parse_run_timestamp(candidate, prefix)
+        if dt is None:
+            continue
+        model_zip = candidate / "model.zip"
+        if not model_zip.exists():
+            continue
+        if latest_dt is None or dt > latest_dt:
+            latest_dt = dt
+            latest_run = candidate
+
+    if latest_run is not None:
+        return latest_run / "model.zip"
+
+    # Legacy fallback: timestamped zip in parent
+    latest_zip = None
+    latest_mtime = -1.0
+    for candidate in prefix.parent.glob(f"{prefix.name}_*.zip"):
         mtime = candidate.stat().st_mtime
         if mtime > latest_mtime:
             latest_mtime = mtime
-            latest_path = candidate
+            latest_zip = candidate
+    if latest_zip is not None:
+        return latest_zip
 
-    if latest_path is None:
-        raise FileNotFoundError(
-            f"No timestamped model found for prefix: {prefix} (expected {prefix.name}_YYYYMMDD_HHMMSS.zip)"
-        )
-    return latest_path
+    raise FileNotFoundError(
+        f"No model found for path/prefix: {path_arg}. "
+        f"Expected either a .zip file, a run dir with model.zip, "
+        f"or a prefix with timestamped run directories."
+    )
 
 
 def main():
