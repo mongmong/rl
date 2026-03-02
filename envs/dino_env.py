@@ -93,15 +93,19 @@ class DinoEnv(gym.Env):
         assert self._page is not None
         self._page.goto(self.config.game_url, wait_until="domcontentloaded")
         self._page.wait_for_timeout(500)
-        self._canvas = self._page.query_selector("canvas#gameCanvas")
-        if self._canvas is None:
-            self._canvas = self._page.query_selector("canvas")
+        self._refresh_canvas()
         if self._canvas is None:
             raise RuntimeError("Could not find game canvas on the page.")
 
         # Ensure game is ready
         self._page.keyboard.press("Space")
         self._page.wait_for_timeout(200)
+
+    def _refresh_canvas(self) -> None:
+        assert self._page is not None
+        self._canvas = self._page.query_selector("canvas#gameCanvas")
+        if self._canvas is None:
+            self._canvas = self._page.query_selector("canvas")
 
     def _get_js_state(self) -> Tuple[Optional[bool], Optional[float]]:
         assert self._page is not None
@@ -128,9 +132,27 @@ class DinoEnv(gym.Env):
         return crashed, distance
 
     def _screenshot_frame(self) -> np.ndarray:
-        assert self._canvas is not None
-        png_bytes = self._canvas.screenshot()
-        return self._preprocess_from_bytes(png_bytes)
+        assert self._page is not None
+        last_err = None
+        for _ in range(3):
+            try:
+                if self._canvas is None:
+                    self._refresh_canvas()
+                if self._canvas is None:
+                    raise RuntimeError("Canvas handle is unavailable.")
+                png_bytes = self._canvas.screenshot()
+                return self._preprocess_from_bytes(png_bytes)
+            except Exception as err:
+                last_err = err
+                self._refresh_canvas()
+                self._page.wait_for_timeout(50)
+
+        # Fallback to full-page screenshot if canvas capture keeps failing.
+        try:
+            png_bytes = self._page.screenshot()
+            return self._preprocess_from_bytes(png_bytes)
+        except Exception as err:
+            raise RuntimeError(f"Unable to capture observation frame: {err}") from last_err
 
     def _preprocess_from_bytes(self, png_bytes: bytes) -> np.ndarray:
         image = Image.open(io.BytesIO(png_bytes))
@@ -171,7 +193,17 @@ class DinoEnv(gym.Env):
         self._episode_start = time.time()
         self._last_distance = 0.0
 
-        obs = self._get_observation()
+        obs = None
+        reset_err = None
+        for _ in range(3):
+            try:
+                obs = self._get_observation()
+                break
+            except Exception as err:
+                reset_err = err
+                self._load_game()
+        if obs is None:
+            raise RuntimeError(f"Failed to capture initial observation: {reset_err}") from reset_err
         info = {"distance": 0.0}
         return obs, info
 
@@ -206,7 +238,18 @@ class DinoEnv(gym.Env):
 
             total_reward += reward
 
-            obs = self._get_observation()
+            try:
+                obs = self._get_observation()
+            except Exception as err:
+                # End the episode gracefully instead of crashing training.
+                terminated = True
+                info = {"distance": distance, "obs_error": str(err)}
+                if self._frame_buffer:
+                    last = self._frame_buffer[-1]
+                    obs = np.stack([last] * self.config.frame_stack, axis=0)
+                else:
+                    obs = np.zeros(self.observation_space.shape, dtype=np.uint8)
+                break
             info = {"distance": distance}
 
             if crashed is True:
