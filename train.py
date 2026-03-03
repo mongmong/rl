@@ -289,10 +289,11 @@ class TrainingProgressCallback(BaseCallback):
     def _on_training_start(self) -> None:
         self.start_time = time.time()
         self._log(
-            f"[progress] 0.00% (0/{self.total_timesteps_target}) | episodes 0"
+            f"[progress] 0.00% (0/{self.total_timesteps_target}) | episodes {self.episodes_completed}"
         )
 
     def _on_step(self) -> bool:
+        current_total = int(self.num_timesteps)
         infos = self.locals.get("infos", [])
         new_obs = self.locals.get("new_obs")
         for info_idx, info in enumerate(infos):
@@ -307,7 +308,6 @@ class TrainingProgressCallback(BaseCallback):
                     self.last_episode_length = int(ep["l"])
             self._save_episode_random_image(info, new_obs, self.episodes_completed, info_idx)
 
-        current_total = int(self.num_timesteps)
         current = max(0, current_total - self.start_timesteps)
         if current < self.next_report_step and current < self.total_timesteps_target:
             return True
@@ -404,7 +404,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--env", default="dino")
     parser.add_argument("--timesteps", type=int, default=None)
-    parser.add_argument("--no-headless", action="store_true")
+    parser.add_argument("--show", action="store_true")
     parser.add_argument("--model_path", default="models/dino_ppo")
     parser.add_argument("--reward_mode", default=None)
     parser.add_argument("--game_url", default=None)
@@ -423,7 +423,7 @@ def main():
     reward_mode = args.reward_mode or config["env"]["reward_mode"]
     game_url = args.game_url or config["env"]["game_url"]
     timesteps = args.timesteps or int(config["training"]["timesteps"])
-    headless = not args.no_headless
+    headless = not args.show
 
     os.makedirs("models", exist_ok=True)
     model_prefix = normalize_model_prefix(args.model_path)

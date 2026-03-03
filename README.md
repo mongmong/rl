@@ -58,7 +58,7 @@ uv run python train.py --env dino --timesteps 200000 --checkpoint_freq 10000
 uv run python evaluate.py --model_path models/dino_ppo --episodes 10
 ```
 
-`train.py` defaults to headless and supports `--no-headless`.
+`train.py` defaults to headless and supports `--show`.
 `evaluate.py` defaults to a visible browser and supports `--headless`.
 
 `evaluate.py` model resolution:

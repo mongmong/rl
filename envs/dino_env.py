@@ -112,6 +112,7 @@ class DinoEnv(gym.Env):
         self._page = None
         self._canvas = None
         self._canvas_clip = None
+        self._last_focus_check = 0.0
         self._frame_buffer: Deque[np.ndarray] = deque(maxlen=self.config.frame_stack)
 
         self._episode_start = 0.0
@@ -121,7 +122,15 @@ class DinoEnv(gym.Env):
         if self._browser is not None:
             return
         self._playwright = _get_shared_playwright()
-        self._browser = self._playwright.chromium.launch(headless=self.config.headless)
+        launch_args = [
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+        ]
+        self._browser = self._playwright.chromium.launch(
+            headless=self.config.headless,
+            args=launch_args,
+        )
         self._page = self._browser.new_page()
 
     def _teardown_browser(self) -> None:
@@ -139,6 +148,7 @@ class DinoEnv(gym.Env):
         self._frame_buffer.clear()
         self._episode_start = time.time()
         self._last_distance = 0.0
+        self._last_focus_check = 0.0
 
     def _restart_environment(self, max_attempts: int = 2) -> bool:
         last_err = None
@@ -168,9 +178,68 @@ class DinoEnv(gym.Env):
         if self._canvas is None:
             raise RuntimeError("Could not find game canvas on the page.")
 
+        self._ensure_page_active(force=True)
         # Ensure game is ready
         self._page.keyboard.press("Space")
         self._page.wait_for_timeout(200)
+        self._resume_runner_if_needed()
+
+    def _resume_runner_if_needed(self) -> None:
+        """
+        Best-effort unpause/start guard for headed mode.
+        Some pages pause the Runner after focus changes.
+        """
+        if self._page is None:
+            return
+        try:
+            self._page.evaluate(
+                """
+                () => {
+                    const r = window.Runner && window.Runner.instance_;
+                    if (!r) return;
+                    if (r.crashed === true || r.gameOver === true) return;
+                    if (r.paused === true && typeof r.play === "function") {
+                        r.play();
+                    }
+                    if (r.playing === false && typeof r.play === "function") {
+                        r.play();
+                    }
+                    if (r.activated === false && typeof r.startGame === "function") {
+                        r.playingIntro = false;
+                        r.startGame();
+                    }
+                }
+                """
+            )
+        except Exception:
+            pass
+
+    def _ensure_page_active(self, force: bool = False) -> None:
+        """
+        Keep headed evaluation responsive by re-focusing the tab/canvas if needed.
+        """
+        if self.config.headless:
+            return
+        assert self._page is not None
+        now = time.time()
+        if not force and now - self._last_focus_check < 1.0:
+            return
+        self._last_focus_check = now
+
+        try:
+            if not self._page.evaluate("() => document.hasFocus()"):
+                self._page.bring_to_front()
+                self._refresh_canvas()
+                if self._canvas is not None:
+                    bbox = self._canvas.bounding_box()
+                    if bbox is not None:
+                        cx = float(bbox["x"] + bbox["width"] / 2.0)
+                        cy = float(bbox["y"] + bbox["height"] / 2.0)
+                        self._page.mouse.click(cx, cy)
+            self._resume_runner_if_needed()
+        except Exception:
+            # Best-effort only; training/eval should continue even if focus check fails.
+            pass
 
     def _refresh_canvas(self) -> None:
         assert self._page is not None
@@ -329,10 +398,12 @@ class DinoEnv(gym.Env):
         truncated = False
         info = {}
         obs = self._blank_observation()
+        self._ensure_page_active()
 
         for _ in range(self.config.action_repeat):
             distance = None
             try:
+                self._resume_runner_if_needed()
                 if action == 1:
                     self._page.keyboard.press("Space")
                 elif action == 2:
