@@ -271,6 +271,30 @@ class PPOWithTrainMetrics(PPO):
             self.progress_logger.info("[ppo] %s%s", progress_prefix, " | ".join(parts))
 
 
+class LoggingCheckpointCallback(CheckpointCallback):
+    def __init__(self, *args, logger: logging.Logger | None = None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.progress_logger = logger
+
+    def _on_step(self) -> bool:
+        continue_training = super()._on_step()
+        if not continue_training:
+            return continue_training
+        if self.n_calls % self.save_freq != 0:
+            return continue_training
+        try:
+            ckpt_path = Path(self.save_path) / f"{self.name_prefix}_{self.num_timesteps}_steps.zip"
+            message = f"[checkpoint] Saved: {ckpt_path}"
+            if self.progress_logger is not None:
+                self.progress_logger.info(message)
+            else:
+                print(message, flush=True)
+        except Exception:
+            # Keep checkpointing robust even if logging formatting/path fails.
+            pass
+        return continue_training
+
+
 class TrainingProgressCallback(BaseCallback):
     def __init__(
         self,
@@ -495,15 +519,9 @@ class TrainingProgressCallback(BaseCallback):
             episode_info = info.get("episode")
             if isinstance(episode_info, dict):
                 ep_len = episode_info.get("l")
-                ep_rew = episode_info.get("r")
                 try:
                     if ep_len is not None:
                         name_parts.append(f"len_{int(ep_len)}")
-                except (TypeError, ValueError):
-                    pass
-                try:
-                    if ep_rew is not None:
-                        name_parts.append(f"rew_{float(ep_rew):.2f}")
                 except (TypeError, ValueError):
                     pass
             image_path = self.episode_image_dir / ("_".join(name_parts) + ".png")
@@ -625,10 +643,11 @@ def main():
 
     callbacks = [eval_callback]
     if checkpoint_freq > 0:
-        checkpoint_callback = CheckpointCallback(
+        checkpoint_callback = LoggingCheckpointCallback(
             save_freq=checkpoint_callback_freq,
             save_path=str(checkpoint_dir),
             name_prefix="ckpt",
+            logger=logger,
         )
         callbacks.append(checkpoint_callback)
 

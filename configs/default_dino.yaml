@@ -3,7 +3,7 @@ env:
   frame_size: [84, 84]
   frame_stack: 4
   action_repeat: 1
-  max_episode_seconds: 120
+  max_episode_seconds: 1200
   reward_mode: hybrid # survival
 
 training:
@@ -21,5 +21,5 @@ training:
   max_grad_norm: 0.5
   save_freq: 10000
   eval_freq: 10000
-  eval_episodes: 5
+  eval_episodes: 10
   tensorboard_log: runs/dino
