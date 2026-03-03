@@ -24,6 +24,7 @@ Inside that run folder:
 
 - `model.zip` (final saved model for the run)
 - `logs/YYYYMMDD_HHMMSS_train.log` (all training logs via Python `logging`)
+- `logs/episode_XXXXXX_random.png` (one random observation frame saved per completed episode)
 - `checkpoints/` (periodic checkpoints + mirrored saved model)
 - `best/` (eval-best `best_model.zip`, if produced)
 - `eval_logs/` (EvalCallback logs)
@@ -57,7 +58,8 @@ uv run python train.py --env dino --timesteps 200000 --checkpoint_freq 10000
 uv run python evaluate.py --model_path models/dino_ppo --episodes 10
 ```
 
-`train.py` and `evaluate.py` default to headless. Use `--no-headless` for a visible browser window.
+`train.py` defaults to headless and supports `--no-headless`.
+`evaluate.py` defaults to a visible browser and supports `--headless`.
 
 `evaluate.py` model resolution:
 

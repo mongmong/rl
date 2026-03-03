@@ -7,7 +7,9 @@ from datetime import datetime
 from pathlib import Path
 from statistics import mean
 
+import numpy as np
 import yaml
+from PIL import Image
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import (
     BaseCallback,
@@ -263,6 +265,7 @@ class TrainingProgressCallback(BaseCallback):
         progress_interval_pct: float = 5.0,
         start_timesteps: int = 0,
         logger: logging.Logger | None = None,
+        episode_image_dir: Path | None = None,
     ) -> None:
         super().__init__()
         self.total_timesteps_target = max(1, int(total_timesteps))
@@ -275,6 +278,7 @@ class TrainingProgressCallback(BaseCallback):
         self.last_episode_reward = None
         self.last_episode_length = None
         self.progress_logger = logger
+        self.episode_image_dir = episode_image_dir
 
     def _log(self, message: str) -> None:
         if self.progress_logger is not None:
@@ -290,7 +294,8 @@ class TrainingProgressCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         infos = self.locals.get("infos", [])
-        for info in infos:
+        new_obs = self.locals.get("new_obs")
+        for info_idx, info in enumerate(infos):
             if not isinstance(info, dict) or "episode" not in info:
                 continue
             ep = info["episode"]
@@ -300,6 +305,7 @@ class TrainingProgressCallback(BaseCallback):
                     self.last_episode_reward = float(ep["r"])
                 if "l" in ep:
                     self.last_episode_length = int(ep["l"])
+            self._save_episode_random_image(info, new_obs, self.episodes_completed, info_idx)
 
         current_total = int(self.num_timesteps)
         current = max(0, current_total - self.start_timesteps)
@@ -352,6 +358,46 @@ class TrainingProgressCallback(BaseCallback):
             f"| episodes {self.episodes_completed} "
             f"| elapsed {format_seconds(elapsed)}"
         )
+
+    def _save_episode_random_image(
+        self,
+        info: dict,
+        new_obs,
+        episode_idx: int,
+        env_idx: int | None = None,
+    ) -> None:
+        if self.episode_image_dir is None:
+            return
+        try:
+            obs_source = info.get("terminal_observation", None)
+            if obs_source is None:
+                obs_source = new_obs
+            if obs_source is None:
+                return
+
+            obs_arr = np.asarray(obs_source)
+            if obs_arr.ndim == 4:
+                # (n_envs, frame_stack, H, W)
+                if env_idx is None or env_idx < 0 or env_idx >= obs_arr.shape[0]:
+                    env_idx = int(np.random.randint(0, obs_arr.shape[0]))
+                frames = obs_arr[env_idx]
+                frame_idx = int(np.random.randint(0, frames.shape[0]))
+                frame = frames[frame_idx]
+            elif obs_arr.ndim == 3:
+                # (frame_stack, H, W)
+                frame_idx = int(np.random.randint(0, obs_arr.shape[0]))
+                frame = obs_arr[frame_idx]
+            elif obs_arr.ndim == 2:
+                frame = obs_arr
+            else:
+                return
+
+            frame_u8 = frame.astype(np.uint8, copy=False)
+            self.episode_image_dir.mkdir(parents=True, exist_ok=True)
+            image_path = self.episode_image_dir / f"episode_{episode_idx:06d}_random.png"
+            Image.fromarray(frame_u8, mode="L").save(image_path)
+        except Exception as err:
+            self._log(f"[warn] Failed to save random episode image: {err}")
 
 
 def main():
@@ -472,6 +518,7 @@ def main():
         progress_interval_pct=args.progress_interval_pct,
         start_timesteps=int(model.num_timesteps),
         logger=logger,
+        episode_image_dir=logs_dir,
     )
     callbacks.append(progress_callback)
     callback = CallbackList(callbacks)

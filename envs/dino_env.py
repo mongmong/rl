@@ -1,7 +1,9 @@
+import atexit
 import io
 import time
 from collections import deque
 from dataclasses import dataclass
+from threading import Lock
 from typing import Deque, Literal, Optional, Tuple
 
 import gymnasium as gym
@@ -17,6 +19,38 @@ except Exception:  # pragma: no cover - optional dependency
 
 
 RewardMode = Literal["survival", "distance", "hybrid"]
+
+
+_SHARED_PLAYWRIGHT = None
+_SHARED_PLAYWRIGHT_LOCK = Lock()
+
+
+def _get_shared_playwright():
+    if sync_playwright is None:
+        raise ImportError(
+            "playwright is required for DinoEnv. Install with `pip install playwright` "
+            "and run `playwright install`."
+        )
+    global _SHARED_PLAYWRIGHT
+    with _SHARED_PLAYWRIGHT_LOCK:
+        if _SHARED_PLAYWRIGHT is None:
+            _SHARED_PLAYWRIGHT = sync_playwright().start()
+        return _SHARED_PLAYWRIGHT
+
+
+def _stop_shared_playwright() -> None:
+    global _SHARED_PLAYWRIGHT
+    with _SHARED_PLAYWRIGHT_LOCK:
+        if _SHARED_PLAYWRIGHT is None:
+            return
+        try:
+            _SHARED_PLAYWRIGHT.stop()
+        except Exception:
+            pass
+        _SHARED_PLAYWRIGHT = None
+
+
+atexit.register(_stop_shared_playwright)
 
 
 @dataclass
@@ -77,6 +111,7 @@ class DinoEnv(gym.Env):
         self._browser = None
         self._page = None
         self._canvas = None
+        self._canvas_clip = None
         self._frame_buffer: Deque[np.ndarray] = deque(maxlen=self.config.frame_stack)
 
         self._episode_start = 0.0
@@ -85,9 +120,45 @@ class DinoEnv(gym.Env):
     def _ensure_browser(self) -> None:
         if self._browser is not None:
             return
-        self._playwright = sync_playwright().start()
+        self._playwright = _get_shared_playwright()
         self._browser = self._playwright.chromium.launch(headless=self.config.headless)
         self._page = self._browser.new_page()
+
+    def _teardown_browser(self) -> None:
+        if self._browser is not None:
+            try:
+                self._browser.close()
+            except Exception:
+                pass
+        self._browser = None
+        self._page = None
+        self._canvas = None
+        self._canvas_clip = None
+
+    def _start_episode_state(self) -> None:
+        self._frame_buffer.clear()
+        self._episode_start = time.time()
+        self._last_distance = 0.0
+
+    def _restart_environment(self, max_attempts: int = 2) -> bool:
+        last_err = None
+        for _ in range(max_attempts):
+            try:
+                self._teardown_browser()
+                self._ensure_browser()
+                self._load_game()
+                self._start_episode_state()
+                return True
+            except Exception as err:
+                last_err = err
+                self._teardown_browser()
+        return False
+
+    def _blank_observation(self) -> np.ndarray:
+        if self._frame_buffer:
+            last = self._frame_buffer[-1]
+            return np.stack([last] * self.config.frame_stack, axis=0)
+        return np.zeros(self.observation_space.shape, dtype=np.uint8)
 
     def _load_game(self) -> None:
         assert self._page is not None
@@ -103,9 +174,45 @@ class DinoEnv(gym.Env):
 
     def _refresh_canvas(self) -> None:
         assert self._page is not None
-        self._canvas = self._page.query_selector("canvas#gameCanvas")
-        if self._canvas is None:
-            self._canvas = self._page.query_selector("canvas")
+        self._canvas = None
+        self._canvas_clip = None
+
+        preferred_selectors = [
+            "canvas#gameCanvas",
+            "canvas#runner-canvas",
+            "canvas#runner",
+        ]
+
+        for selector in preferred_selectors:
+            candidate = self._page.query_selector(selector)
+            if candidate is None:
+                continue
+            bbox = candidate.bounding_box()
+            if bbox is None:
+                continue
+            if bbox["width"] < 120 or bbox["height"] < 20:
+                continue
+            self._canvas = candidate
+            self._canvas_clip = bbox
+            return
+
+        # Fallback: choose the largest visible canvas on the page.
+        best = None
+        best_bbox = None
+        best_area = -1.0
+        for candidate in self._page.query_selector_all("canvas"):
+            bbox = candidate.bounding_box()
+            if bbox is None:
+                continue
+            if bbox["width"] < 120 or bbox["height"] < 20:
+                continue
+            area = bbox["width"] * bbox["height"]
+            if area > best_area:
+                best = candidate
+                best_bbox = bbox
+                best_area = area
+        self._canvas = best
+        self._canvas_clip = best_bbox
 
     def _get_js_state(self) -> Tuple[Optional[bool], Optional[float]]:
         assert self._page is not None
@@ -147,9 +254,18 @@ class DinoEnv(gym.Env):
                 self._refresh_canvas()
                 self._page.wait_for_timeout(50)
 
-        # Fallback to full-page screenshot if canvas capture keeps failing.
+        # Fallback to clipped page screenshot using the last known canvas bbox.
         try:
-            png_bytes = self._page.screenshot()
+            if self._canvas_clip is not None:
+                clip = {
+                    "x": float(self._canvas_clip["x"]),
+                    "y": float(self._canvas_clip["y"]),
+                    "width": float(self._canvas_clip["width"]),
+                    "height": float(self._canvas_clip["height"]),
+                }
+                png_bytes = self._page.screenshot(clip=clip)
+            else:
+                png_bytes = self._page.screenshot()
             return self._preprocess_from_bytes(png_bytes)
         except Exception as err:
             raise RuntimeError(f"Unable to capture observation frame: {err}") from last_err
@@ -186,70 +302,66 @@ class DinoEnv(gym.Env):
         if seed is not None:
             self._np_random, _ = seeding.np_random(seed)
 
-        self._ensure_browser()
-        self._load_game()
-
-        self._frame_buffer.clear()
-        self._episode_start = time.time()
-        self._last_distance = 0.0
-
-        obs = None
         reset_err = None
         for _ in range(3):
             try:
+                self._ensure_browser()
+                self._load_game()
+                self._start_episode_state()
                 obs = self._get_observation()
-                break
+                info = {"distance": 0.0}
+                return obs, info
             except Exception as err:
                 reset_err = err
-                self._load_game()
-        if obs is None:
-            raise RuntimeError(f"Failed to capture initial observation: {reset_err}") from reset_err
-        info = {"distance": 0.0}
-        return obs, info
+                self._teardown_browser()
+
+        raise RuntimeError(f"Failed to reset environment after retries: {reset_err}") from reset_err
 
     def step(self, action: int):
-        assert self._page is not None
+        if self._page is None:
+            restarted = self._restart_environment()
+            obs = self._blank_observation()
+            info = {"distance": None, "env_restarted": restarted, "obs_error": "Page not initialized"}
+            return obs, 0.0, True, False, info
 
         total_reward = 0.0
         terminated = False
         truncated = False
         info = {}
+        obs = self._blank_observation()
 
         for _ in range(self.config.action_repeat):
-            if action == 1:
-                self._page.keyboard.press("Space")
-            elif action == 2:
-                self._page.keyboard.down("ArrowDown")
-                self._page.wait_for_timeout(50)
-                self._page.keyboard.up("ArrowDown")
-
-            self._page.wait_for_timeout(50)
-
-            crashed, distance = self._get_js_state()
-
-            reward = 1.0
-            if self.config.reward_mode in ("distance", "hybrid") and distance is not None:
-                delta = float(distance) - float(self._last_distance)
-                if self.config.reward_mode == "distance":
-                    reward = max(delta, 0.0)
-                else:
-                    reward = 1.0 + 0.01 * max(delta, 0.0)
-                self._last_distance = float(distance)
-
-            total_reward += reward
-
+            distance = None
             try:
+                if action == 1:
+                    self._page.keyboard.press("Space")
+                elif action == 2:
+                    self._page.keyboard.down("ArrowDown")
+                    self._page.wait_for_timeout(50)
+                    self._page.keyboard.up("ArrowDown")
+
+                self._page.wait_for_timeout(50)
+
+                crashed, distance = self._get_js_state()
+
+                reward = 1.0
+                if self.config.reward_mode in ("distance", "hybrid") and distance is not None:
+                    delta = float(distance) - float(self._last_distance)
+                    if self.config.reward_mode == "distance":
+                        reward = max(delta, 0.0)
+                    else:
+                        reward = 1.0 + 0.01 * max(delta, 0.0)
+                    self._last_distance = float(distance)
+
                 obs = self._get_observation()
             except Exception as err:
-                # End the episode gracefully instead of crashing training.
+                restarted = self._restart_environment()
+                info = {"distance": distance, "obs_error": str(err), "env_restarted": restarted}
                 terminated = True
-                info = {"distance": distance, "obs_error": str(err)}
-                if self._frame_buffer:
-                    last = self._frame_buffer[-1]
-                    obs = np.stack([last] * self.config.frame_stack, axis=0)
-                else:
-                    obs = np.zeros(self.observation_space.shape, dtype=np.uint8)
+                obs = self._blank_observation()
                 break
+
+            total_reward += reward
             info = {"distance": distance}
 
             if crashed is True:
@@ -271,9 +383,4 @@ class DinoEnv(gym.Env):
         return self._get_observation()[-1]
 
     def close(self):
-        if self._browser is not None:
-            self._browser.close()
-            self._browser = None
-        if self._playwright is not None:
-            self._playwright.stop()
-            self._playwright = None
+        self._teardown_browser()

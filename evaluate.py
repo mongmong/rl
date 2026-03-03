@@ -87,11 +87,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", default="models/dino_ppo")
     parser.add_argument("--episodes", type=int, default=10)
-    parser.add_argument(
-        "--headless",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
+    parser.add_argument("--headless", action="store_true")
     parser.add_argument("--reward_mode", default="survival")
     parser.add_argument("--game_url", default="https://elgoog.im/t-rex/")
     args = parser.parse_args()
