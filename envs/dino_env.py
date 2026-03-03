@@ -56,6 +56,7 @@ atexit.register(_stop_shared_playwright)
 @dataclass
 class DinoEnvConfig:
     headless: bool = True
+    auto_focus: bool = True
     game_url: str = "https://elgoog.im/t-rex/"
     frame_size: Tuple[int, int] = (84, 84)
     frame_stack: int = 4
@@ -71,6 +72,7 @@ class DinoEnv(gym.Env):
     def __init__(
         self,
         headless: bool = True,
+        auto_focus: bool = True,
         game_url: str = "https://elgoog.im/t-rex/",
         frame_size: Tuple[int, int] = (84, 84),
         frame_stack: int = 4,
@@ -88,6 +90,7 @@ class DinoEnv(gym.Env):
 
         self.config = DinoEnvConfig(
             headless=headless,
+            auto_focus=auto_focus,
             game_url=game_url,
             frame_size=frame_size,
             frame_stack=frame_stack,
@@ -113,6 +116,7 @@ class DinoEnv(gym.Env):
         self._canvas = None
         self._canvas_clip = None
         self._last_focus_check = 0.0
+        self._game_loaded = False
         self._frame_buffer: Deque[np.ndarray] = deque(maxlen=self.config.frame_stack)
 
         self._episode_start = 0.0
@@ -143,6 +147,7 @@ class DinoEnv(gym.Env):
         self._page = None
         self._canvas = None
         self._canvas_clip = None
+        self._game_loaded = False
 
     def _start_episode_state(self) -> None:
         self._frame_buffer.clear()
@@ -183,6 +188,50 @@ class DinoEnv(gym.Env):
         self._page.keyboard.press("Space")
         self._page.wait_for_timeout(200)
         self._resume_runner_if_needed()
+        self._game_loaded = True
+
+    def _restart_game_without_reload(self) -> bool:
+        """
+        Restart current episode without page navigation to avoid visible flicker.
+        """
+        if self._page is None:
+            return False
+        try:
+            restarted = bool(
+                self._page.evaluate(
+                    """
+                    () => {
+                        const r = window.Runner && window.Runner.instance_;
+                        if (!r) return false;
+                        if (typeof r.restart === "function") {
+                            r.restart();
+                            return true;
+                        }
+                        if (typeof r.play === "function") {
+                            r.crashed = false;
+                            r.gameOver = false;
+                            r.playingIntro = false;
+                            r.play();
+                            return true;
+                        }
+                        return false;
+                    }
+                    """
+                )
+            )
+            if not restarted:
+                # Generic fallback for pages that do not expose Runner internals.
+                self._page.keyboard.press("Space")
+                self._page.wait_for_timeout(80)
+                self._page.keyboard.press("ArrowUp")
+                restarted = True
+            if restarted:
+                self._page.wait_for_timeout(120)
+                self._resume_runner_if_needed()
+                self._refresh_canvas()
+            return restarted
+        except Exception:
+            return False
 
     def _resume_runner_if_needed(self) -> None:
         """
@@ -218,7 +267,7 @@ class DinoEnv(gym.Env):
         """
         Keep headed evaluation responsive by re-focusing the tab/canvas if needed.
         """
-        if self.config.headless:
+        if self.config.headless or not self.config.auto_focus:
             return
         assert self._page is not None
         now = time.time()
@@ -227,7 +276,10 @@ class DinoEnv(gym.Env):
         self._last_focus_check = now
 
         try:
-            if not self._page.evaluate("() => document.hasFocus()"):
+            has_focus = bool(self._page.evaluate("() => document.hasFocus()"))
+            if force and not has_focus:
+                # One-time focus on init/recovery so the runner loop starts.
+                # We avoid force focus during normal stepping to reduce flicker.
                 self._page.bring_to_front()
                 self._refresh_canvas()
                 if self._canvas is not None:
@@ -375,7 +427,13 @@ class DinoEnv(gym.Env):
         for _ in range(3):
             try:
                 self._ensure_browser()
-                self._load_game()
+                if not self._game_loaded:
+                    self._load_game()
+                else:
+                    self._ensure_page_active(force=False)
+                    restarted = self._restart_game_without_reload()
+                    if not restarted:
+                        self._load_game()
                 self._start_episode_state()
                 obs = self._get_observation()
                 info = {"distance": 0.0}
@@ -398,12 +456,14 @@ class DinoEnv(gym.Env):
         truncated = False
         info = {}
         obs = self._blank_observation()
-        self._ensure_page_active()
+        if self.config.auto_focus:
+            self._ensure_page_active()
 
         for _ in range(self.config.action_repeat):
             distance = None
             try:
-                self._resume_runner_if_needed()
+                if self.config.auto_focus:
+                    self._resume_runner_if_needed()
                 if action == 1:
                     self._page.keyboard.press("Space")
                 elif action == 2:

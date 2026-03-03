@@ -24,10 +24,16 @@ Inside that run folder:
 
 - `model.zip` (final saved model for the run)
 - `logs/YYYYMMDD_HHMMSS_train.log` (all training logs via Python `logging`)
-- `logs/episode_XXXXXX_random.png` (one random observation frame saved per completed episode)
+- `logs/episode_XXXXXX_steps_XXXXXXXXX_...png` (one sampled observation frame per completed episode, with step/episode metadata in filename)
 - `checkpoints/` (periodic checkpoints + mirrored saved model)
 - `best/` (eval-best `best_model.zip`, if produced)
 - `eval_logs/` (EvalCallback logs)
+
+Exploration override (applies to new or resumed models):
+
+```bash
+uv run python train.py --env dino --model_path models/dino_ppo --ent_coef 0.02
+```
 
 ## Resume Behavior
 
@@ -52,13 +58,33 @@ uv run python train.py --env dino --timesteps 200000 --checkpoint_freq 10000
 
 `--checkpoint_freq` is interpreted as timesteps. With `n_envs > 1`, callback frequency is adjusted to keep checkpoint cadence close to requested timestep intervals.
 
+## Cleanup
+
+Dry-run cleanup of run folders missing both `model.zip` and checkpoint zips:
+
+```bash
+uv run python scripts/clean_models.py
+```
+
+Delete them:
+
+```bash
+uv run python scripts/clean_models.py --yes
+```
+
 ## Evaluation
 
 ```bash
 uv run python evaluate.py --model_path models/dino_ppo --episodes 10
 ```
 
-`train.py` defaults to headless and supports `--show`.
+Optional stochastic evaluation with sampling temperature:
+
+```bash
+uv run python evaluate.py --model_path models/dino_ppo --episodes 10 --sample_temperature 1.5
+```
+
+`train.py` defaults to headless and supports `--show` (headed mode, `--n_envs` must be `1`).
 `evaluate.py` defaults to a visible browser and supports `--headless`.
 
 `evaluate.py` model resolution:

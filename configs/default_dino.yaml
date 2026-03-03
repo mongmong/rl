@@ -2,9 +2,9 @@ env:
   game_url: https://elgoog.im/t-rex/
   frame_size: [84, 84]
   frame_stack: 4
-  action_repeat: 4
+  action_repeat: 1
   max_episode_seconds: 120
-  reward_mode: survival
+  reward_mode: hybrid # survival
 
 training:
   algo: PPO
@@ -14,7 +14,7 @@ training:
   batch_size: 256
   gamma: 0.99
   gae_lambda: 0.95
-  ent_coef: 0.01
+  ent_coef: 0.1
   clip_range: 0.1
   n_epochs: 4
   vf_coef: 0.5

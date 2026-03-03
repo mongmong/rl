@@ -35,6 +35,7 @@ def make_env(headless: bool, reward_mode: str, game_url: str, config: dict):
     def _init():
         return DinoEnv(
             headless=headless,
+            auto_focus=True,
             game_url=game_url,
             frame_size=tuple(config["env"]["frame_size"]),
             frame_stack=int(config["env"]["frame_stack"]),
@@ -231,6 +232,8 @@ class PPOWithTrainMetrics(PPO):
         super().__init__(*args, **kwargs)
         self.latest_train_metrics = {}
         self.progress_logger: logging.Logger | None = None
+        self.progress_total_timesteps_target = 0
+        self.progress_start_timesteps = 0
 
     def train(self) -> None:
         super().train()
@@ -254,8 +257,18 @@ class PPOWithTrainMetrics(PPO):
                 continue
         self.latest_train_metrics = metrics
         if metrics and self.progress_logger is not None:
+            progress_prefix = ""
+            target = int(getattr(self, "progress_total_timesteps_target", 0) or 0)
+            if target > 0:
+                start = int(getattr(self, "progress_start_timesteps", 0) or 0)
+                current = max(0, int(self.num_timesteps) - start)
+                pct = min(100.0, (100.0 * current) / target)
+                progress_prefix = (
+                    f"{pct:6.2f}% ({current}/{target}) "
+                    f"| total_steps {int(self.num_timesteps)} | "
+                )
             parts = [f"{name} {value:.4f}" for name, value in metrics.items()]
-            self.progress_logger.info("[ppo] %s", " | ".join(parts))
+            self.progress_logger.info("[ppo] %s%s", progress_prefix, " | ".join(parts))
 
 
 class TrainingProgressCallback(BaseCallback):
@@ -277,6 +290,11 @@ class TrainingProgressCallback(BaseCallback):
         self.episodes_completed = 0
         self.last_episode_reward = None
         self.last_episode_length = None
+        self.action_space_n: int | None = None
+        self.n_envs = 1
+        self.current_episode_action_counts: list[dict[int, int]] = []
+        self.last_episode_action_counts: dict[int, int] | None = None
+        self.last_episode_action_total = 0
         self.progress_logger = logger
         self.episode_image_dir = episode_image_dir
 
@@ -288,12 +306,29 @@ class TrainingProgressCallback(BaseCallback):
 
     def _on_training_start(self) -> None:
         self.start_time = time.time()
+        setattr(self.model, "progress_total_timesteps_target", int(self.total_timesteps_target))
+        setattr(self.model, "progress_start_timesteps", int(self.start_timesteps))
+        action_space = getattr(self.model, "action_space", None)
+        n_actions = getattr(action_space, "n", None)
+        if isinstance(n_actions, int) and n_actions > 0:
+            self.action_space_n = n_actions
+        else:
+            self.action_space_n = None
+        vec_env = getattr(self.model, "env", None)
+        self.n_envs = int(getattr(vec_env, "num_envs", 1) or 1)
+        self.current_episode_action_counts = [self._new_action_counter() for _ in range(self.n_envs)]
+        self.last_episode_action_counts = None
+        self.last_episode_action_total = 0
         self._log(
             f"[progress] 0.00% (0/{self.total_timesteps_target}) | episodes {self.episodes_completed}"
         )
 
     def _on_step(self) -> bool:
         current_total = int(self.num_timesteps)
+        actions = self.locals.get("actions", None)
+        if actions is None:
+            actions = self.locals.get("clipped_actions", None)
+        self._update_action_stats(actions)
         infos = self.locals.get("infos", [])
         new_obs = self.locals.get("new_obs")
         for info_idx, info in enumerate(infos):
@@ -306,7 +341,14 @@ class TrainingProgressCallback(BaseCallback):
                     self.last_episode_reward = float(ep["r"])
                 if "l" in ep:
                     self.last_episode_length = int(ep["l"])
-            self._save_episode_random_image(info, new_obs, self.episodes_completed, info_idx)
+            self._finalize_episode_action_stats(info_idx)
+            self._save_episode_random_image(
+                info,
+                new_obs,
+                self.episodes_completed,
+                info_idx,
+                current_total,
+            )
 
         current = max(0, current_total - self.start_timesteps)
         if current < self.next_report_step and current < self.total_timesteps_target:
@@ -336,6 +378,7 @@ class TrainingProgressCallback(BaseCallback):
             metric_parts.append(f"last_ep_rew {self.last_episode_reward:.2f}")
         if self.last_episode_length is not None:
             metric_parts.append(f"last_ep_len {self.last_episode_length}")
+        metric_parts.append(self._format_episode_action_stats())
 
         metrics_str = " | ".join(metric_parts) if metric_parts else "metrics pending"
         self._log(
@@ -356,8 +399,57 @@ class TrainingProgressCallback(BaseCallback):
         self._log(
             f"[progress] 100.00% ({self.total_timesteps_target}/{self.total_timesteps_target}) "
             f"| episodes {self.episodes_completed} "
-            f"| elapsed {format_seconds(elapsed)}"
+            f"| elapsed {format_seconds(elapsed)} "
+            f"| {self._format_episode_action_stats()}"
         )
+
+    def _update_action_stats(self, actions) -> None:
+        if actions is None:
+            return
+        try:
+            arr = np.asarray(actions).reshape(-1)
+        except Exception:
+            return
+        if len(arr) != len(self.current_episode_action_counts):
+            self.current_episode_action_counts = [self._new_action_counter() for _ in range(len(arr))]
+        for env_idx, value in enumerate(arr):
+            try:
+                action = int(value)
+            except (TypeError, ValueError):
+                continue
+            counts = self.current_episode_action_counts[env_idx]
+            counts[action] = counts.get(action, 0) + 1
+
+    def _new_action_counter(self) -> dict[int, int]:
+        if self.action_space_n is not None:
+            return {action: 0 for action in range(self.action_space_n)}
+        return {}
+
+    def _finalize_episode_action_stats(self, env_idx: int) -> None:
+        if env_idx < 0 or env_idx >= len(self.current_episode_action_counts):
+            return
+        counts = self.current_episode_action_counts[env_idx]
+        self.last_episode_action_counts = dict(counts)
+        self.last_episode_action_total = int(sum(counts.values()))
+        self.current_episode_action_counts[env_idx] = self._new_action_counter()
+
+    def _format_episode_action_stats(self) -> str:
+        if not self.last_episode_action_counts or self.last_episode_action_total <= 0:
+            return "last_ep_actions n/a"
+        total = float(self.last_episode_action_total)
+        if self.action_space_n is not None:
+            parts = []
+            for action in range(self.action_space_n):
+                count = self.last_episode_action_counts.get(action, 0)
+                pct = (100.0 * count) / total
+                parts.append(f"a{action} {pct:.1f}%")
+            return f"last_ep_actions ({int(total)}): " + ", ".join(parts)
+        parts = []
+        for action in sorted(self.last_episode_action_counts):
+            count = self.last_episode_action_counts[action]
+            pct = (100.0 * count) / total
+            parts.append(f"a{action} {pct:.1f}%")
+        return f"last_ep_actions ({int(total)}): " + ", ".join(parts)
 
     def _save_episode_random_image(
         self,
@@ -365,6 +457,7 @@ class TrainingProgressCallback(BaseCallback):
         new_obs,
         episode_idx: int,
         env_idx: int | None = None,
+        total_steps: int | None = None,
     ) -> None:
         if self.episode_image_dir is None:
             return
@@ -394,7 +487,26 @@ class TrainingProgressCallback(BaseCallback):
 
             frame_u8 = frame.astype(np.uint8, copy=False)
             self.episode_image_dir.mkdir(parents=True, exist_ok=True)
-            image_path = self.episode_image_dir / f"episode_{episode_idx:06d}_random.png"
+            name_parts = [f"episode_{episode_idx:06d}"]
+            if total_steps is not None:
+                name_parts.append(f"steps_{int(total_steps):09d}")
+            if env_idx is not None and env_idx >= 0:
+                name_parts.append(f"env_{int(env_idx)}")
+            episode_info = info.get("episode")
+            if isinstance(episode_info, dict):
+                ep_len = episode_info.get("l")
+                ep_rew = episode_info.get("r")
+                try:
+                    if ep_len is not None:
+                        name_parts.append(f"len_{int(ep_len)}")
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    if ep_rew is not None:
+                        name_parts.append(f"rew_{float(ep_rew):.2f}")
+                except (TypeError, ValueError):
+                    pass
+            image_path = self.episode_image_dir / ("_".join(name_parts) + ".png")
             Image.fromarray(frame_u8, mode="L").save(image_path)
         except Exception as err:
             self._log(f"[warn] Failed to save random episode image: {err}")
@@ -413,6 +525,7 @@ def main():
     parser.add_argument("--config", default="configs/default_dino.yaml")
     parser.add_argument("--progress_interval_pct", type=float, default=0.1)
     parser.add_argument("--checkpoint_freq", type=int, default=10000)
+    parser.add_argument("--ent_coef", type=float, default=None)
     parser.add_argument("--new", action="store_true")
     args = parser.parse_args()
 
@@ -424,6 +537,8 @@ def main():
     game_url = args.game_url or config["env"]["game_url"]
     timesteps = args.timesteps or int(config["training"]["timesteps"])
     headless = not args.show
+    if args.show and args.n_envs > 1:
+        raise ValueError("--show supports only --n_envs 1 to avoid multiple headed browser windows.")
 
     os.makedirs("models", exist_ok=True)
     model_prefix = normalize_model_prefix(args.model_path)
@@ -491,6 +606,10 @@ def main():
     else:
         logger.info("No prior model or checkpoint found: starting a fresh model")
         model = create_new_model(env, config)
+
+    if args.ent_coef is not None:
+        model.ent_coef = float(args.ent_coef)
+        logger.info("Overriding entropy coefficient: ent_coef=%s", model.ent_coef)
 
     model.progress_logger = logger
 
